@@ -1,0 +1,141 @@
+name: Build PDF from Markdown & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**.md'
+      - '.github/workflows/**.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc weasyprint
+
+      - name: Create Python merge script
+        run: |
+          cat << 'PYEOF' > merge_md.py
+          import sys
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          ignore_dirs = {'.git', 'node_modules', 'vendor', 'dist', 'build', '.github'}
+          md_files = []
+
+          for path in Path('.').rglob('*.md'):
+              if any(part in ignore_dirs for part in path.parts):
+                  continue
+              if path.name == 'combined.md':
+                  continue
+              md_files.append(path)
+
+          md_files.sort(key=lambda p: str(p).lower())
+          print(f"Found {len(md_files)} markdown file(s)")
+
+          if not md_files:
+              print("ERROR: no markdown files found")
+              sys.exit(1)
+
+          stamp = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+          out = Path('combined.md')
+          with out.open('w', encoding='utf-8') as f:
+              f.write('# Repository Documentation\n\n')
+              f.write(f'_Generated: {stamp}_\n\n---\n')
+              for md in md_files:
+                  content = md.read_text(encoding='utf-8', errors='replace')
+                  f.write(f'\n\n# File: {md.as_posix()}\n\n')
+                  f.write(content)
+                  f.write('\n\n---\n')
+          print(f"Wrote combined.md")
+          PYEOF
+
+      - name: Merge Markdown files
+        run: python3 merge_md.py
+
+      - name: Convert Markdown to HTML
+        run: |
+          pandoc combined.md \
+            -o documentation.html \
+            --standalone \
+            --self-contained \
+            --toc \
+            --metadata title="Repository Documentation"
+
+      - name: Convert HTML to PDF with WeasyPrint
+        run: |
+          weasyprint documentation.html documentation.pdf
+
+      - name: Verify PDF
+        run: |
+          ls -lh documentation.pdf
+          file documentation.pdf
+
+      - name: Generate release tag
+        id: tag
+        run: |
+          echo "tag=v$(date -u +'%Y.%m.%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Documentation PDF ${{ steps.tag.outputs.tag }}"
+          body: |
+            Auto-generated PDF from Markdown sources.
+            - **Build:** ${{ github.run_number }}
+            - **Commit:** `${{ github.sha }}`
+            - **Date:** ${{ steps.tag.outputs.date }}
+          files: documentation.pdf
+          draft: false
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify ntfy.sh
+        if: always()
+        env:
+          NTFY_TOPIC: az_alerts
+          STATUS: ${{ job.status }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$STATUS" = "success" ]; then
+            TITLE="PDF Build Succeeded"
+            PRIORITY="default"
+            TAGS="white_check_mark,book"
+          else
+            TITLE="PDF Build Failed"
+            PRIORITY="high"
+            TAGS="x,warning"
+          fi
+
+          if [ -n "$RELEASE_URL" ]; then
+            BODY="Repo: $REPO ($REF) | Tag: $TAG | Release: $RELEASE_URL"
+            CLICK="$RELEASE_URL"
+          else
+            BODY="Repo: $REPO ($REF) | Status: $STATUS | Run: $RUN_URL"
+            CLICK="$RUN_URL"
+          fi
+
+          curl -sS -H "Title: $TITLE" -H "Priority: $PRIORITY" -H "Tags: $TAGS" -H "Click: $CLICK" --data-binary "$BODY" "https://ntfy.sh/$NTFY_TOPIC" || true
